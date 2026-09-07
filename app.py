@@ -28,6 +28,22 @@ st.set_page_config(page_title="Nifty50 Premarket Tracker", layout="wide")
 
 KEY_OPTIONS = ["NIFTY", "BANKNIFTY", "NIFTYNEXT50", "FNO", "ALL", "SME", "OTHERS"]
 
+# Canonical column schema — ALWAYS present in the DataFrame, even when the
+# API returns zero rows. This is what previously broke: an empty `rows` list
+# produced a DataFrame with *no columns at all*, so any later
+# `df.dropna(subset=["PctChange"])` raised KeyError: ['PctChange'].
+RAW_COLUMNS = [
+    "Symbol", "PrevClose", "IEP", "Change", "PctChange",
+    "YearHigh", "YearLow", "FinalQuantity", "TotalTradedVolume",
+    "TotalTurnover", "MarketCap", "TotalBuyQuantity", "TotalSellQuantity",
+]
+
+NUMERIC_COLUMNS = [c for c in RAW_COLUMNS if c != "Symbol"]
+
+
+class NseFetchError(Exception):
+    """Raised when NSE returns a response we can't use (blocked, empty, bad JSON)."""
+
 
 # -------------------------------------------------------------------
 # NSE session / fetch helpers
@@ -49,28 +65,55 @@ def get_nse_session() -> requests.Session:
     return session
 
 
-def fetch_preopen_data(session: requests.Session, key: str = "NIFTY", retries: int = 3):
+def fetch_preopen_data(session: requests.Session, key: str = "NIFTY", retries: int = 3) -> dict:
+    """Fetch and JSON-decode the pre-open payload.
+
+    Raises NseFetchError with a human-readable reason on any failure mode:
+    network error, non-200 status, or a 200 response that isn't valid JSON
+    (NSE sometimes serves an HTML bot-check page with a 200 status).
+    """
     url = f"https://www.nseindia.com/api/market-data-pre-open?key={key}"
-    last_exc = None
-    for _ in range(retries):
+    last_reason = "Unknown error."
+
+    for attempt in range(retries):
         try:
             resp = session.get(url, timeout=10)
-            if resp.status_code == 200:
-                return resp.json()
         except requests.RequestException as exc:
-            last_exc = exc
-        time.sleep(2)
-        session = get_nse_session()
-    if last_exc:
-        raise last_exc
-    resp.raise_for_status()
+            last_reason = f"Network error: {exc}"
+            session = get_nse_session()
+            time.sleep(2)
+            continue
+
+        if resp.status_code != 200:
+            last_reason = f"HTTP {resp.status_code} from NSE (likely bot/IP block)."
+            session = get_nse_session()
+            time.sleep(2)
+            continue
+
+        try:
+            payload = resp.json()
+        except ValueError:
+            last_reason = "NSE returned a non-JSON response (likely a bot-check/HTML page)."
+            session = get_nse_session()
+            time.sleep(2)
+            continue
+
+        if not isinstance(payload, dict) or not payload.get("data"):
+            last_reason = "NSE returned an empty payload (no 'data' rows)."
+            session = get_nse_session()
+            time.sleep(2)
+            continue
+
+        return payload  # success
+
+    raise NseFetchError(f"Failed after {retries} attempts. Last reason: {last_reason}")
 
 
 def parse_preopen(data: dict) -> pd.DataFrame:
     rows = []
     for item in data.get("data", []):
-        meta = item.get("metadata", {})
-        pre = item.get("detail", {}).get("preOpenMarket", {})
+        meta = item.get("metadata", {}) or {}
+        pre = item.get("detail", {}).get("preOpenMarket", {}) or {}
         rows.append(
             {
                 "Symbol": meta.get("symbol"),
@@ -88,7 +131,17 @@ def parse_preopen(data: dict) -> pd.DataFrame:
                 "TotalSellQuantity": pre.get("totalSellQuantity"),
             }
         )
-    return pd.DataFrame(rows)
+
+    # Always build with the full column set, so downstream code never hits
+    # a KeyError even if `rows` is empty.
+    df = pd.DataFrame(rows, columns=RAW_COLUMNS)
+
+    # Coerce anything that should be numeric — NSE occasionally sends
+    # numbers as strings, which silently breaks comparisons/arithmetic.
+    for col in NUMERIC_COLUMNS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df
 
 
 def add_trade_signals(df: pd.DataFrame) -> pd.DataFrame:
@@ -99,11 +152,14 @@ def add_trade_signals(df: pd.DataFrame) -> pd.DataFrame:
 
     df["OrderImbalance"] = np.where(total_qty > 0, (buy - sell) / total_qty, np.nan)
     df["BuySellRatio"] = np.where(sell > 0, buy / sell, np.nan)
+
+    year_high = df["YearHigh"]
+    year_low = df["YearLow"]
     df["DistFrom52WHighPct"] = np.where(
-        df["YearHigh"] > 0, (df["IEP"] - df["YearHigh"]) / df["YearHigh"] * 100, np.nan
+        year_high.notna() & (year_high > 0), (df["IEP"] - year_high) / year_high * 100, np.nan
     )
     df["DistFrom52WLowPct"] = np.where(
-        df["YearLow"] > 0, (df["IEP"] - df["YearLow"]) / df["YearLow"] * 100, np.nan
+        year_low.notna() & (year_low > 0), (df["IEP"] - year_low) / year_low * 100, np.nan
     )
     df["NearCircuitFlag"] = df["PctChange"].abs() >= 9
     df["WatchScore"] = df["PctChange"].abs() * (1 + df["OrderImbalance"].abs().fillna(0))
@@ -129,7 +185,7 @@ def is_preopen_session_live():
 @st.cache_data(ttl=25, show_spinner=False)
 def load_data(key: str) -> pd.DataFrame:
     session = get_nse_session()
-    raw = fetch_preopen_data(session, key=key)
+    raw = fetch_preopen_data(session, key=key)  # raises NseFetchError on failure
     df = parse_preopen(raw)
     df = df.dropna(subset=["PctChange"]).sort_values("PctChange", ascending=False)
     df = add_trade_signals(df)
@@ -208,13 +264,17 @@ if not live:
 try:
     with st.spinner("Fetching data from NSE..."):
         df = load_data(key)
-except Exception as e:
+except NseFetchError as e:
     st.error(
         "Could not fetch data from NSE. This usually means NSE's bot-check blocked "
-        "this server's IP (common on cloud-hosted deployments). Try 'Refresh now', "
-        "or run the app locally — see the README for details.\n\n"
-        f"Error: {e}"
+        "this server's IP (common on cloud-hosted deployments), or NSE returned an "
+        "empty/invalid payload. Try 'Refresh now', or run the app locally — see the "
+        "README for details.\n\n"
+        f"Details: {e}"
     )
+    st.stop()
+except Exception as e:
+    st.error(f"Unexpected error while loading data: {e}")
     st.stop()
 
 if df.empty:

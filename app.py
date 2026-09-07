@@ -26,7 +26,7 @@ import plotly.graph_objects as go
 # -------------------------------------------------------------------
 st.set_page_config(page_title="Nifty50 Premarket Tracker", layout="wide")
 
-KEY_OPTIONS = ["NIFTY", "BANKNIFTY", "NIFTYNEXT50", "FNO", "ALL", "SME", "OTHERS"]
+KEY_OPTIONS = ["NIFTY 50", "BANKNIFTY", "NIFTYNEXT50", "FNO", "ALL", "SME", "OTHERS"]
 
 
 # -------------------------------------------------------------------
@@ -49,7 +49,7 @@ def get_nse_session() -> requests.Session:
     return session
 
 
-def fetch_preopen_data(session: requests.Session, key: str = "NIFTY", retries: int = 3):
+def fetch_preopen_data(session: requests.Session, key: str = "NIFTY 50", retries: int = 3):
     url = f"https://www.nseindia.com/api/market-data-pre-open?key={key}"
     last_exc = None
     for _ in range(retries):

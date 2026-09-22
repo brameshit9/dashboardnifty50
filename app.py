@@ -26,7 +26,7 @@ import plotly.graph_objects as go
 # -------------------------------------------------------------------
 st.set_page_config(page_title="Nifty50 Premarket Tracker", layout="wide")
 
-KEY_OPTIONS = ["NIFTY 50", "BANKNIFTY", "NIFTYNEXT50", "FNO", "ALL", "SME", "OTHERS"]
+KEY_OPTIONS = ["NIFTY 50", "NIFTY BANK", "NIFTYNEXT50", "FNO", "ALL", "SME", "OTHERS"]
 
 
 # -------------------------------------------------------------------
